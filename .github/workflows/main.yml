@@ -1,0 +1,177 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+
+          # Optionally disable Network Level Auth (NLA) if necessary; leave enabled for better security
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
+
+          # Ensure firewall rule exists (replace or recreate)
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" > $null 2>&1
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create or Update Static RDP User (robust)
+        shell: pwsh
+        env:
+          # these are read from GitHub Secrets; set them in the repo or organization secrets
+          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          # Read from environment (populated from secrets)
+          $username = $env:RDP_USERNAME
+          $password = $env:RDP_PASSWORD
+
+          # Defensive checks
+          if (-not $username -or $username.Trim().Length -eq 0) {
+            Write-Error "RDP_USERNAME is empty or not provided. Set the secret 'RDP_USERNAME'."
+            exit 1
+          }
+          if (-not $password -or $password.Trim().Length -eq 0) {
+            Write-Error "RDP_PASSWORD is empty or not provided. Set the secret 'RDP_PASSWORD'."
+            exit 1
+          }
+
+          # Detect accidental masking / misuse: literal '***' should not be used
+          if ($username -eq '***' -or $password -eq '***') {
+            Write-Error "Detected literal '***' for username or password. Do NOT hardcode or assign '***' — use real values or GitHub Secrets."
+            exit 1
+          }
+
+          # Optional: enforce minimum password complexity/length
+          if ($password.Length -lt 8) {
+            Write-Warning "Password length is less than 8 characters. Windows may reject weak passwords."
+            # optionally fail: uncomment next two lines to enforce
+            # Write-Error "Password must be at least 8 characters long."
+            # exit 1
+          }
+
+          # Convert to SecureString
+          try {
+            $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          } catch {
+            Write-Error "Failed to convert password to SecureString: $_"
+            exit 1
+          }
+
+          # Create or update the local user
+          try {
+            $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+            if (-not $existing) {
+              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -UserMayNotChangePassword:$false
+              Write-Host "Created local user: $username"
+            } else {
+              Set-LocalUser -Name $username -Password $securePass
+              Write-Host "Updated password for existing user: $username"
+            }
+          } catch {
+            Write-Error "Failed to create or update user: $_"
+            exit 1
+          }
+
+          # Ensure group membership (Remote Desktop Users required; admin is optional)
+          try {
+            if (-not (Get-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue)) {
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+            }
+            # Add to Administrators if you want admin privileges (comment out if not desired)
+            if (-not (Get-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue)) {
+              Add-LocalGroupMember -Group "Administrators" -Member $username
+            }
+          } catch {
+            Write-Warning "Failed to adjust group membership: $_"
+          }
+
+          # Export username and (optionally) password to the job environment
+          # Password printed later — if from a GitHub Secret it will usually be masked in logs
+          echo "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if (-not $env:TAILSCALE_AUTH_KEY -or $env:TAILSCALE_AUTH_KEY.Trim().Length -eq 0) {
+            Write-Error "TAILSCALE_AUTH_KEY secret not provided. Set the secret 'TAILSCALE_AUTH_KEY'."
+            exit 1
+          }
+
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          # Wait for Tailscale to assign an IPv4
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 12) {
+              $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 | Select-String -Pattern '\d+\.\d+\.\d+\.\d+' -AllMatches).Matches.Value -join ','
+              if ($tsIP) { break }
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+
+          # Use the first IP if multiple present
+          $firstIP = $tsIP.Split(',')[0].Trim()
+          echo "TAILSCALE_IP=$firstIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP assigned: $firstIP"
+
+      - name: Verify RDP Accessibility
+        shell: pwsh
+        run: |
+          Write-Host "Testing RDP connectivity to: $env:TAILSCALE_IP"
+          if (-not $env:TAILSCALE_IP) {
+            Write-Error "No Tailscale IP available to test."
+            exit 1
+          }
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Detailed
+          if (-not $testResult.TcpTestSucceeded) {
+            Write-Error "TCP connection to RDP port 3389 failed. Details:`n$($testResult | Out-String)"
+            exit 1
+          }
+          Write-Host "TCP connectivity to RDP port 3389 succeeded."
+
+      - name: Maintain Connection (prints password; secret-sourced value will likely be masked)
+        shell: pwsh
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USERNAME"
+          # This will print the password into the log. If you used GitHub Secrets it will typically be masked.
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "==================`n"
+
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+            Start-Sleep -Seconds 300
+          }
