@@ -102,4 +102,4 @@ The runner will stay online for up to 6 hours (the `timeout-minutes` value). Whe
   - Go back to the GitHub Actions workflow run page and click **Cancel workflow**. This is important as it stops the runner and prevents you from using up your free Actions minutes.
 
 -----
-### Feel free to star this repository
+### Feel free to star this repository ⭐
