@@ -1,4 +1,4 @@
-name: RDP
+name: AZURE RDP WITH IDP
 
 on:
   workflow_dispatch:
