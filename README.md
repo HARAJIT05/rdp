@@ -39,7 +39,7 @@ An auth key allows the GitHub runner to join your private Tailnet without needin
 
 1.  Go to your Tailscale Admin Console: [https://login.tailscale.com/admin/settings/keys](https://login.tailscale.com/admin/settings/keys)
 2.  Click **Generate auth key...**.
-3.  Click **Generate key**.
+3.  Click **Generate key and check on the reusable toggle**.
 4.  **Copy the key immediately**. You will not be able to see it again. It will look like `tskey-auth-k...`.
 
 ### Step 3: Configure GitHub Secrets
